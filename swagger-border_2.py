@@ -27,7 +27,7 @@ proxies = {
 }
 
 # 开启代理
-SET_PROXY = True
+SET_PROXY = False
 
 #black_list_status = [401, 404, 502, 503]  # 状态码黑名单
 black_list_status = []  # 状态码黑名单
@@ -225,13 +225,13 @@ def fill_parameters(parameters, url, csv_params=None):
         # 根据类型填充默认值（当没有 csv_val 提供时）
         if csv_val is None:
             if param_type == 'string':
-                value = 'a'
+                value = 'admin'
             elif param_type in ('integer', 'number'):
                 value = 1
             elif param_type == 'boolean':
                 value = True
             else:
-                value = 'a' if param_type is None else ''
+                value = 'admin' if param_type is None else ''
         else:
             value = csv_val
 
@@ -433,24 +433,51 @@ def go_api_docs(url, csv_params=None):
 
         # 计算 base_url（兼容 swagger 2 basePath / openapi v3 servers）
         base_url = domain
-        if isinstance(data, dict) and 'basePath' in data and data.get('basePath'):
-            bp = data.get('basePath')
-            if bp.startswith('http'):
-                base_url = bp
-            else:
-                base_url = domain.rstrip('/') + '/' + bp.lstrip('/')
-        elif isinstance(data, dict) and 'servers' in data and isinstance(data['servers'], list) and len(data['servers']) > 0:
-            server_url = data['servers'][0].get('url', '')
-            if server_url.startswith('http'):
-                base_url = server_url
-            else:
-                base_url = domain.rstrip('/') + '/' + server_url.lstrip('/')
-        else:
-            base_url = domain
+        # 合并 definitions 与 components.schemas（优先 components）
+        definitions = {}
+
+        if isinstance(data, dict):
+            # swagger 2.0 definitions
+            if 'definitions' in data and isinstance(data['definitions'], dict):
+                definitions.update(data['definitions'])
+            # openapi 3.0 components.schemas
+            components = (data.get('components') or {}).get('schemas') if isinstance(data.get('components'), dict) else None
+            if components and isinstance(components, dict):
+                # components schema 优先覆盖 definitions 中的同名项
+                definitions.update(components)
+
+        base_url = domain
 
         paths = (data.get('paths', {}) if isinstance(data, dict) else {})
-        definitions = data.get('definitions', {}) if isinstance(data, dict) else {}
+
         swagger_result = []
+
+        def resolve_schema_properties(schema):
+            """
+            给定一个 schema（可能是 $ref 或者 有 properties 字段），返回一个 list of {name, type}
+            """
+            props = []
+            if not schema:
+                return props
+            if isinstance(schema, dict) and '$ref' in schema:
+                ref_name = schema['$ref'].split('/')[-1]
+                model = definitions.get(ref_name)
+                if model and isinstance(model, dict):
+                    for prop_name, prop_details in model.get('properties', {}).items():
+                        props.append({
+                            'name': prop_name,
+                            'type': prop_details.get('type'),
+                            'in': 'body'
+                        })
+            elif isinstance(schema, dict) and 'properties' in schema:
+                for prop_name, prop_details in schema.get('properties', {}).items():
+                    props.append({
+                        'name': prop_name,
+                        'type': prop_details.get('type'),
+                        'in': 'body'
+                    })
+            return props
+
         for path, methods in paths.items():
 #            path = path.replace("/dssn/", "/dssn/stage-api/", 1)
             for method, details in methods.items():  # get / post / put / update / delete / head...
@@ -460,32 +487,104 @@ def go_api_docs(url, csv_params=None):
                 # req_path：如果 base_url 是完整 url（包含域和可能的 path），拼接 paths 时用 urljoin 更稳健
                 req_path = urljoin(base_url.rstrip('/') + '/', path.lstrip('/'))
                 summary = details.get('summary', path)  # 概要信息
-                consumes = details.get('consumes', [])  # 数据请求类型 application/json
-                params = details.get('parameters', [])
+
+                # collects consumes/content types
+                consumes = details.get('consumes') or []
+
+                # OpenAPI3 uses requestBody.content
+                if not consumes and isinstance(details.get('requestBody'), dict):
+                    content = details['requestBody'].get('content', {})
+                    if isinstance(content, dict):
+                        consumes = list(content.keys())
+
+                params = details.get('parameters', []) or []
+                # 如果是 OpenAPI3，可能存在 requestBody
+                if isinstance(details.get('requestBody'), dict):
+                    rb = details['requestBody']
+                    content = rb.get('content', {})
+                    # 遍历每个 media type，取第一个可用的 schema 合并为 body param
+                    if isinstance(content, dict):
+                        for media_type, media_obj in content.items():
+                            schema = media_obj.get('schema')
+                            # 将 schema 的 properties 展开为参数
+                            body_props = resolve_schema_properties(schema)
+                            # 如果 resolve_schema_properties 没有提取到属性，作为整体 body 对象处理
+                            if body_props:
+                                for p in body_props:
+                                    # name 可能存在重复，确保 name 字段有意义
+                                    params.append({
+                                        'name': p['name'],
+                                        'in': p.get('in', 'body'),
+                                        'type': p.get('type')
+                                    })
+                            else:
+                                # 整体 body 对象（没有 properties），使用单个 body 参数
+                                params.append({
+                                    'name': 'body',
+                                    'in': 'body',
+                                    'type': None,
+                                    'schema': schema
+                                })
+                            # 只需要第一个 media type 来构造参数（否则会重复）
+                            break
+
                 logger.debug(f'test on {summary} => {method} => {req_path}')
                 param_info = []
+
                 for param in params:
+                    # param 可能直接是 schema/property dict（来自 definitions 展开）
                     param_name = param.get('name')
                     param_in = param.get('in')
-                    schema = param.get('schema')
+                    schema = param.get('schema') or {}
                     # 判断是否存在自定义的模型或对象
-                    if schema and isinstance(schema, dict) and '$ref' in schema:
+                    if isinstance(schema, dict) and '$ref' in schema:
                         ref = schema['$ref'].split('/')[-1]
-                        if ref in definitions:  # 如果在 definitions 中声明了参数属性，则去 definitions 定义中获取参数及属性信息
-                            # 递归处理定义中的属性
-                            for prop_name, prop_details in definitions[ref].get('properties', {}).items():
+                        # 如果在 definitions/components 中声明了参数属性，则去 definitions 定义中获取参数及属性信息
+                        if ref in definitions:
+                            model = definitions[ref]
+                            if isinstance(model, dict):
+                                for prop_name, prop_details in model.get('properties', {}).items():
+                                    param_info.append({
+                                        'name': prop_name,
+                                        'in': param_in or 'body',
+                                        'type': prop_details.get('type')
+                                    })
+                        else:
+                            # 如果找不到 ref 的模型，则保留原始 ref 参数
+                            param_info.append({
+                                'name': param_name or ref,
+                                'in': param_in or 'body',
+                                'type': None
+                            })
+                    else:
+                        # 如果 param 本身带有 schema 且 schema 有 properties（例如 inline schema）
+                        if isinstance(schema, dict) and 'properties' in schema:
+                            for prop_name, prop_details in schema.get('properties', {}).items():
                                 param_info.append({
                                     'name': prop_name,
-                                    'in': param_in,
+                                    'in': param_in or 'body',
                                     'type': prop_details.get('type')
                                 })
-                    else:
-                        param_type = param.get('type')
-                        param_info.append({
-                            'name': param_name,
-                            'in': param_in,
-                            'type': param_type
-                        })
+                        else:
+                            # 普通参数（query/path/formData/header）
+                            param_type = param.get('type')
+                            # fallback: if no name but schema contains $ref properties, expand
+                            if not param_name and isinstance(schema, dict) and '$ref' in schema:
+                                ref = schema['$ref'].split('/')[-1]
+                                if ref in definitions:
+                                    model = definitions[ref]
+                                    for prop_name, prop_details in model.get('properties', {}).items():
+                                        param_info.append({
+                                            'name': prop_name,
+                                            'in': param_in or 'body',
+                                            'type': prop_details.get('type')
+                                        })
+                                    continue
+                            param_info.append({
+                                'name': param_name,
+                                'in': param_in,
+                                'type': param_type
+                            })
 
                 # 解析 swagger 获取到所有需要的数据
                 swagger_result.append({
